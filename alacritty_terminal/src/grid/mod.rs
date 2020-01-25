@@ -15,12 +15,13 @@
 //! A specialized 2d grid implementation optimized for use in a terminal.
 
 use std::cmp::{max, min, Ordering};
-use std::ops::{Deref, Index, IndexMut, Range, RangeFrom, RangeFull, RangeInclusive, RangeTo};
+use std::ops::{Deref, Index, IndexMut, Range, RangeFrom, RangeFull, RangeTo};
 
 use serde::{Deserialize, Serialize};
 
-use crate::index::{self, Column, IndexRange, Line, Point};
+use crate::index::{Column, IndexRange, Line, Point};
 use crate::selection::Selection;
+use crate::term::cell::Flags;
 
 mod row;
 pub use self::row::Row;
@@ -63,17 +64,48 @@ impl<T: PartialEq> ::std::cmp::PartialEq for Grid<T> {
             && self.display_offset.eq(&other.display_offset)
             && self.scroll_limit.eq(&other.scroll_limit)
             && self.selection.eq(&other.selection)
-            && self.url_highlight.eq(&other.url_highlight)
     }
 }
 
 pub trait GridCell {
     fn is_empty(&self) -> bool;
-    fn is_wrap(&self) -> bool;
-    fn set_wrap(&mut self, wrap: bool);
+    fn flags(&self) -> &Flags;
+    fn flags_mut(&mut self) -> &mut Flags;
+
+    /// Fast equality approximation.
+    ///
+    /// This is a faster alternative to [`PartialEq`],
+    /// but might report inequal cells as equal.
+    fn fast_eq(&self, other: Self) -> bool;
 }
 
 /// Represents the terminal display contents
+///
+/// ```notrust
+/// ┌─────────────────────────┐  <-- max_scroll_limit + lines
+/// │                         │
+/// │      UNINITIALIZED      │
+/// │                         │
+/// ├─────────────────────────┤  <-- raw.len()
+/// │                         │
+/// │      RESIZE BUFFER      │
+/// │                         │
+/// ├─────────────────────────┤  <-- scroll_limit + lines
+/// │                         │
+/// │     SCROLLUP REGION     │
+/// │                         │
+/// ├─────────────────────────┤v lines
+/// │                         │|
+/// │     VISIBLE  REGION     │|
+/// │                         │|
+/// ├─────────────────────────┤^ <-- display_offset
+/// │                         │
+/// │    SCROLLDOWN REGION    │
+/// │                         │
+/// └─────────────────────────┘  <-- zero
+///                           ^
+///                          cols
+/// ```
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Grid<T> {
     /// Lines in the grid. Each row holds a list of cells corresponding to the
@@ -81,35 +113,26 @@ pub struct Grid<T> {
     raw: Storage<T>,
 
     /// Number of columns
-    cols: index::Column,
+    cols: Column,
 
-    /// Number of lines.
-    ///
-    /// Invariant: lines is equivalent to raw.len()
-    lines: index::Line,
+    /// Number of visible lines.
+    lines: Line,
 
     /// Offset of displayed area
     ///
     /// If the displayed region isn't at the bottom of the screen, it stays
     /// stationary while more text is emitted. The scrolling implementation
     /// updates this offset accordingly.
-    #[serde(default)]
     display_offset: usize,
 
     /// An limit on how far back it's possible to scroll
-    #[serde(default)]
     scroll_limit: usize,
 
     /// Selected region
     #[serde(skip)]
     pub selection: Option<Selection>,
 
-    #[serde(default)]
     max_scroll_limit: usize,
-
-    /// Range for URL hover highlights
-    #[serde(default)]
-    pub url_highlight: Option<RangeInclusive<index::Linear>>,
 }
 
 #[derive(Copy, Clone)]
@@ -121,8 +144,8 @@ pub enum Scroll {
     Bottom,
 }
 
-impl<T: GridCell + Copy + Clone> Grid<T> {
-    pub fn new(lines: index::Line, cols: index::Column, scrollback: usize, template: T) -> Grid<T> {
+impl<T: GridCell + PartialEq + Copy> Grid<T> {
+    pub fn new(lines: Line, cols: Column, scrollback: usize, template: T) -> Grid<T> {
         let raw = Storage::with_capacity(lines, Row::new(cols, &template));
         Grid {
             raw,
@@ -132,26 +155,19 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
             scroll_limit: 0,
             selection: None,
             max_scroll_limit: scrollback,
-            url_highlight: None,
         }
     }
 
-    pub fn buffer_to_visible(&self, point: impl Into<Point<usize>>) -> Point<usize> {
+    pub fn buffer_to_visible(&self, point: impl Into<Point<usize>>) -> Option<Point<usize>> {
         let mut point = point.into();
 
-        let offset = point.line.saturating_sub(self.display_offset);
-
-        if point.line < self.display_offset {
-            point.col = self.num_cols();
-            point.line = self.num_lines().0 - 1;
-        } else if offset >= *self.num_lines() {
-            point.col = Column(0);
-            point.line = 0;
-        } else {
-            point.line = self.lines.0 - offset - 1;
+        if point.line < self.display_offset || point.line >= self.display_offset + self.lines.0 {
+            return None;
         }
 
-        point
+        point.line = self.lines.0 + self.display_offset - point.line - 1;
+
+        Some(point)
     }
 
     pub fn visible_to_buffer(&self, point: Point) -> Point<usize> {
@@ -192,8 +208,8 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
     pub fn resize(
         &mut self,
         reflow: bool,
-        lines: index::Line,
-        cols: index::Column,
+        lines: Line,
+        cols: Column,
         cursor_pos: &mut Point,
         template: &T,
     ) {
@@ -238,7 +254,7 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
     /// Alacritty keeps the cursor at the bottom of the terminal as long as there
     /// is scrollback available. Once scrollback is exhausted, new lines are
     /// simply added to the bottom of the screen.
-    fn grow_lines(&mut self, new_line_count: index::Line, template: &T) {
+    fn grow_lines(&mut self, new_line_count: Line, template: &T) {
         let lines_added = new_line_count - self.lines;
 
         // Need to "resize" before updating buffer
@@ -255,107 +271,173 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
         self.display_offset = self.display_offset.saturating_sub(*lines_added);
     }
 
-    fn grow_cols(
-        &mut self,
-        reflow: bool,
-        cols: index::Column,
-        cursor_pos: &mut Point,
-        template: &T,
-    ) {
+    // Grow number of columns in each row, reflowing if necessary
+    fn grow_cols(&mut self, reflow: bool, cols: Column, cursor_pos: &mut Point, template: &T) {
+        // Check if a row needs to be wrapped
+        let should_reflow = |row: &Row<T>| -> bool {
+            let len = Column(row.len());
+            reflow && len < cols && row[len - 1].flags().contains(Flags::WRAPLINE)
+        };
+
         let mut new_empty_lines = 0;
-        let mut new_raw: Vec<Row<T>> = Vec::with_capacity(self.raw.len());
+        let mut reversed: Vec<Row<T>> = Vec::with_capacity(self.raw.len());
         for (i, mut row) in self.raw.drain().enumerate().rev() {
-            if let Some(last_row) = new_raw.last_mut() {
-                // Grow the current line if there's wrapped content available
-                if reflow
-                    && last_row.len() < cols.0
-                    && last_row.last().map(GridCell::is_wrap) == Some(true)
-                {
-                    // Remove wrap flag before appending additional cells
-                    if let Some(cell) = last_row.last_mut() {
-                        cell.set_wrap(false);
+            // FIXME: Rust 1.39.0+ allows moving in pattern guard here
+            // Check if reflowing shoud be performed
+            let mut last_row = reversed.last_mut();
+            let last_row = match last_row {
+                Some(ref mut last_row) if should_reflow(last_row) => last_row,
+                _ => {
+                    reversed.push(row);
+                    continue;
+                },
+            };
+
+            // Remove wrap flag before appending additional cells
+            if let Some(cell) = last_row.last_mut() {
+                cell.flags_mut().remove(Flags::WRAPLINE);
+            }
+
+            // Remove leading spacers when reflowing wide char to the previous line
+            let last_len = last_row.len();
+            if last_len >= 2
+                && !last_row[Column(last_len - 2)].flags().contains(Flags::WIDE_CHAR)
+                && last_row[Column(last_len - 1)].flags().contains(Flags::WIDE_CHAR_SPACER)
+            {
+                last_row.shrink(Column(last_len - 1));
+            }
+
+            // Append as many cells from the next line as possible
+            let len = min(row.len(), cols.0 - last_row.len());
+
+            // Insert leading spacer when there's not enough room for reflowing wide char
+            let mut cells = if row[Column(len - 1)].flags().contains(Flags::WIDE_CHAR) {
+                let mut cells = row.front_split_off(len - 1);
+
+                let mut spacer = *template;
+                spacer.flags_mut().insert(Flags::WIDE_CHAR_SPACER);
+                cells.push(spacer);
+
+                cells
+            } else {
+                row.front_split_off(len)
+            };
+
+            last_row.append(&mut cells);
+
+            if row.is_empty() {
+                let raw_len = i + 1 + reversed.len();
+                if raw_len < self.lines.0 || self.scroll_limit == 0 {
+                    // Add new line and move lines up if we can't pull from history
+                    cursor_pos.line = Line(cursor_pos.line.saturating_sub(1));
+                    new_empty_lines += 1;
+                } else {
+                    // Make sure viewport doesn't move if line is outside of the visible
+                    // area
+                    if i < self.display_offset {
+                        self.display_offset = self.display_offset.saturating_sub(1);
                     }
 
-                    // Append as many cells from the next line as possible
-                    let len = min(row.len(), cols.0 - last_row.len());
-                    let mut cells = row.front_split_off(len);
-                    last_row.append(&mut cells);
-
-                    if row.is_empty() {
-                        let raw_len = i + 1 + new_raw.len();
-                        if raw_len < self.lines.0 || self.scroll_limit == 0 {
-                            // Add new line and move lines up if we can't pull from history
-                            cursor_pos.line = Line(cursor_pos.line.saturating_sub(1));
-                            new_empty_lines += 1;
-                        } else {
-                            // Make sure viewport doesn't move if line is outside of the visible
-                            // area
-                            if i < self.display_offset {
-                                self.display_offset = self.display_offset.saturating_sub(1);
-                            }
-
-                            // Remove one line from scrollback, since we just moved it to the
-                            // viewport
-                            self.scroll_limit = self.scroll_limit.saturating_sub(1);
-                            self.display_offset = min(self.display_offset, self.scroll_limit);
-                        }
-
-                        // Don't push line into the new buffer
-                        continue;
-                    } else if let Some(cell) = last_row.last_mut() {
-                        // Set wrap flag if next line still has cells
-                        cell.set_wrap(true);
-                    }
+                    // Remove one line from scrollback, since we just moved it to the
+                    // viewport
+                    self.scroll_limit = self.scroll_limit.saturating_sub(1);
+                    self.display_offset = min(self.display_offset, self.scroll_limit);
                 }
+
+                // Don't push line into the new buffer
+                continue;
+            } else if let Some(cell) = last_row.last_mut() {
+                // Set wrap flag if next line still has cells
+                cell.flags_mut().insert(Flags::WRAPLINE);
             }
 
-            new_raw.push(row);
-        }
-
-        // Add padding lines
-        new_raw.append(&mut vec![Row::new(cols, template); new_empty_lines]);
-
-        // Fill remaining cells and reverse iterator
-        let mut reversed = Vec::with_capacity(new_raw.len());
-        for mut row in new_raw.drain(..).rev() {
-            if row.len() < cols.0 {
-                row.grow(cols, template);
-            }
             reversed.push(row);
         }
 
-        self.raw.replace_inner(reversed);
+        // Add padding lines
+        reversed.append(&mut vec![Row::new(cols, template); new_empty_lines]);
+
+        // Fill remaining cells and reverse iterator
+        let mut new_raw = Vec::with_capacity(reversed.len());
+        for mut row in reversed.drain(..).rev() {
+            if row.len() < cols.0 {
+                row.grow(cols, template);
+            }
+            new_raw.push(row);
+        }
+
+        self.raw.replace_inner(new_raw);
 
         self.cols = cols;
     }
 
-    fn shrink_cols(&mut self, reflow: bool, cols: index::Column, template: &T) {
+    // Shrink number of columns in each row, reflowing if necessary
+    fn shrink_cols(&mut self, reflow: bool, cols: Column, template: &T) {
         let mut new_raw = Vec::with_capacity(self.raw.len());
         let mut buffered = None;
         for (i, mut row) in self.raw.drain().enumerate().rev() {
+            // Append lines left over from previous row
             if let Some(buffered) = buffered.take() {
                 row.append_front(buffered);
             }
 
-            let mut wrapped = row.shrink(cols);
-            new_raw.push(row);
+            loop {
+                // FIXME: Rust 1.39.0+ allows moving in pattern guard here
+                // Check if reflowing shoud be performed
+                let wrapped = row.shrink(cols);
+                let mut wrapped = match wrapped {
+                    Some(_) if reflow => wrapped.unwrap(),
+                    _ => {
+                        new_raw.push(row);
+                        break;
+                    },
+                };
 
-            while let (Some(mut wrapped_cells), true) = (wrapped.take(), reflow) {
-                // Set line as wrapped if cells got removed
-                if let Some(cell) = new_raw.last_mut().and_then(|r| r.last_mut()) {
-                    cell.set_wrap(true);
+                // Insert spacer if a wide char would be wrapped into the last column
+                if row.len() >= cols.0 && row[cols - 1].flags().contains(Flags::WIDE_CHAR) {
+                    wrapped.insert(0, row[cols - 1]);
+
+                    let mut spacer = *template;
+                    spacer.flags_mut().insert(Flags::WIDE_CHAR_SPACER);
+                    row[cols - 1] = spacer;
                 }
 
-                if Some(true) == wrapped_cells.last().map(|c| c.is_wrap() && i >= 1)
-                    && wrapped_cells.len() < cols.0
+                // Remove wide char spacer before shrinking
+                let len = wrapped.len();
+                if (len == 1 || (len >= 2 && !wrapped[len - 2].flags().contains(Flags::WIDE_CHAR)))
+                    && wrapped[len - 1].flags().contains(Flags::WIDE_CHAR_SPACER)
+                {
+                    if len == 1 {
+                        row[cols - 1].flags_mut().insert(Flags::WRAPLINE);
+                        new_raw.push(row);
+                        break;
+                    } else {
+                        wrapped[len - 2].flags_mut().insert(Flags::WRAPLINE);
+                        wrapped.truncate(len - 1);
+                    }
+                }
+
+                new_raw.push(row);
+
+                // Set line as wrapped if cells got removed
+                if let Some(cell) = new_raw.last_mut().and_then(|r| r.last_mut()) {
+                    cell.flags_mut().insert(Flags::WRAPLINE);
+                }
+
+                if wrapped
+                    .last()
+                    .map(|c| c.flags().contains(Flags::WRAPLINE) && i >= 1)
+                    .unwrap_or(false)
+                    && wrapped.len() < cols.0
                 {
                     // Make sure previous wrap flag doesn't linger around
-                    if let Some(cell) = wrapped_cells.last_mut() {
-                        cell.set_wrap(false);
+                    if let Some(cell) = wrapped.last_mut() {
+                        cell.flags_mut().remove(Flags::WRAPLINE);
                     }
 
                     // Add removed cells to start of next row
-                    buffered = Some(wrapped_cells);
+                    buffered = Some(wrapped);
+                    break;
                 } else {
                     // Make sure viewport doesn't move if line is outside of the visible area
                     if i < self.display_offset {
@@ -363,17 +445,11 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
                     }
 
                     // Make sure new row is at least as long as new width
-                    let occ = wrapped_cells.len();
+                    let occ = wrapped.len();
                     if occ < cols.0 {
-                        wrapped_cells.append(&mut vec![*template; cols.0 - occ]);
+                        wrapped.append(&mut vec![*template; cols.0 - occ]);
                     }
-                    let mut row = Row::from_vec(wrapped_cells, occ);
-
-                    // Since inserted might exceed cols, we need to check it again
-                    wrapped = row.shrink(cols);
-
-                    // Add new row with all removed cells
-                    new_raw.push(row);
+                    row = Row::from_vec(wrapped, occ);
 
                     // Increase scrollback history
                     self.scroll_limit = min(self.scroll_limit + 1, self.max_scroll_limit);
@@ -394,11 +470,10 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
     /// of the terminal window.
     ///
     /// Alacritty takes the same approach.
-    fn shrink_lines(&mut self, target: index::Line) {
+    fn shrink_lines(&mut self, target: Line) {
         let prev = self.lines;
 
         self.selection = None;
-        self.url_highlight = None;
         self.raw.rotate(*prev as isize - *target as isize);
         self.raw.shrink_visible_lines(target);
         self.lines = target;
@@ -409,19 +484,17 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
     /// # Panics
     ///
     /// This method will panic if `Line` is larger than the grid dimensions
-    pub fn line_to_offset(&self, line: index::Line) -> usize {
+    pub fn line_to_offset(&self, line: Line) -> usize {
         assert!(line < self.num_lines());
 
         *(self.num_lines() - line - 1)
     }
 
     #[inline]
-    pub fn scroll_down(
-        &mut self,
-        region: &Range<index::Line>,
-        positions: index::Line,
-        template: &T,
-    ) {
+    pub fn scroll_down(&mut self, region: &Range<Line>, positions: Line, template: &T) {
+        let num_lines = self.num_lines().0;
+        let num_cols = self.num_cols().0;
+
         // Whether or not there is a scrolling region active, as long as it
         // starts at the top, we can do a full rotation which just involves
         // changing the start index.
@@ -431,10 +504,10 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
             // Rotate the entire line buffer. If there's a scrolling region
             // active, the bottom lines are restored in the next step.
             self.raw.rotate_up(*positions);
-            if let Some(ref mut selection) = self.selection {
-                selection.rotate(-(*positions as isize));
-            }
-            self.url_highlight = None;
+            self.selection = self
+                .selection
+                .take()
+                .and_then(|s| s.rotate(num_lines, num_cols, region, -(*positions as isize)));
 
             self.decrease_scroll_limit(*positions);
 
@@ -449,6 +522,12 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
                 self.raw[i].reset(&template);
             }
         } else {
+            // Rotate selection to track content
+            self.selection = self
+                .selection
+                .take()
+                .and_then(|s| s.rotate(num_lines, num_cols, region, -(*positions as isize)));
+
             // Subregion rotation
             for line in IndexRange((region.start + positions)..region.end).rev() {
                 self.raw.swap_lines(line, line - positions);
@@ -463,12 +542,14 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
     /// scroll_up moves lines at the bottom towards the top
     ///
     /// This is the performance-sensitive part of scrolling.
-    pub fn scroll_up(&mut self, region: &Range<index::Line>, positions: index::Line, template: &T) {
+    pub fn scroll_up(&mut self, region: &Range<Line>, positions: Line, template: &T) {
+        let num_lines = self.num_lines().0;
+        let num_cols = self.num_cols().0;
+
         if region.start == Line(0) {
             // Update display offset when not pinned to active area
             if self.display_offset != 0 {
-                self.display_offset =
-                    min(self.display_offset + *positions, self.len() - self.num_lines().0);
+                self.display_offset = min(self.display_offset + *positions, self.len() - num_lines);
             }
 
             self.increase_scroll_limit(*positions, template);
@@ -476,16 +557,16 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
             // Rotate the entire line buffer. If there's a scrolling region
             // active, the bottom lines are restored in the next step.
             self.raw.rotate(-(*positions as isize));
-            if let Some(ref mut selection) = self.selection {
-                selection.rotate(*positions as isize);
-            }
-            self.url_highlight = None;
+            self.selection = self
+                .selection
+                .take()
+                .and_then(|s| s.rotate(num_lines, num_cols, region, *positions as isize));
 
-            // // This next loop swaps "fixed" lines outside of a scroll region
-            // // back into place after the rotation. The work is done in buffer-
-            // // space rather than terminal-space to avoid redundant
-            // // transformations.
-            let fixed_lines = *self.num_lines() - *region.end;
+            // This next loop swaps "fixed" lines outside of a scroll region
+            // back into place after the rotation. The work is done in buffer-
+            // space rather than terminal-space to avoid redundant
+            // transformations.
+            let fixed_lines = num_lines - *region.end;
 
             for i in 0..fixed_lines {
                 self.raw.swap(i, i + *positions);
@@ -498,6 +579,12 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
                 self.raw[i + fixed_lines].reset(&template);
             }
         } else {
+            // Rotate selection to track content
+            self.selection = self
+                .selection
+                .take()
+                .and_then(|s| s.rotate(num_lines, num_cols, region, *positions as isize));
+
             // Subregion rotation
             for line in IndexRange(region.start..(region.end - positions)) {
                 self.raw.swap_lines(line, line + positions);
@@ -510,11 +597,33 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
         }
     }
 
+    pub fn clear_viewport(&mut self, template: &T) {
+        // Determine how many lines to scroll up by.
+        let end = Point { line: 0, col: self.num_cols() };
+        let mut iter = self.iter_from(end);
+        while let Some(cell) = iter.prev() {
+            if !cell.is_empty() || iter.cur.line >= *self.lines {
+                break;
+            }
+        }
+        debug_assert!(iter.cur.line <= *self.lines);
+        let positions = self.lines - iter.cur.line;
+        let region = Line(0)..self.num_lines();
+
+        // Reset display offset
+        self.display_offset = 0;
+
+        // Clear the viewport
+        self.scroll_up(&region, positions, template);
+
+        // Reset rotated lines
+        for i in positions.0..self.lines.0 {
+            self.raw[i].reset(&template);
+        }
+    }
+
     // Completely reset the grid state
     pub fn reset(&mut self, template: &T) {
-        // Explicitly purge all lines from history
-        let shrinkage = self.raw.len() - self.lines.0;
-        self.raw.shrink_lines(shrinkage);
         self.clear_history();
 
         // Reset all visible lines
@@ -524,14 +633,13 @@ impl<T: GridCell + Copy + Clone> Grid<T> {
 
         self.display_offset = 0;
         self.selection = None;
-        self.url_highlight = None;
     }
 }
 
 #[allow(clippy::len_without_is_empty)]
 impl<T> Grid<T> {
     #[inline]
-    pub fn num_lines(&self) -> index::Line {
+    pub fn num_lines(&self) -> Line {
         self.lines
     }
 
@@ -540,11 +648,14 @@ impl<T> Grid<T> {
     }
 
     #[inline]
-    pub fn num_cols(&self) -> index::Column {
+    pub fn num_cols(&self) -> Column {
         self.cols
     }
 
     pub fn clear_history(&mut self) {
+        // Explicitly purge all lines from history
+        let shrinkage = self.raw.len() - self.lines.0;
+        self.raw.shrink_lines(shrinkage);
         self.scroll_limit = 0;
     }
 
@@ -651,11 +762,11 @@ impl<'a, T> BidirectionalIterator for GridIterator<'a, T> {
 }
 
 /// Index active region by line
-impl<T> Index<index::Line> for Grid<T> {
+impl<T> Index<Line> for Grid<T> {
     type Output = Row<T>;
 
     #[inline]
-    fn index(&self, index: index::Line) -> &Row<T> {
+    fn index(&self, index: Line) -> &Row<T> {
         &self.raw[index]
     }
 }
@@ -670,9 +781,9 @@ impl<T> Index<usize> for Grid<T> {
     }
 }
 
-impl<T> IndexMut<index::Line> for Grid<T> {
+impl<T> IndexMut<Line> for Grid<T> {
     #[inline]
-    fn index_mut(&mut self, index: index::Line) -> &mut Row<T> {
+    fn index_mut(&mut self, index: Line) -> &mut Row<T> {
         &mut self.raw[index]
     }
 }

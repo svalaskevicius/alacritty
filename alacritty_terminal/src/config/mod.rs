@@ -60,7 +60,7 @@ pub struct Config<T> {
 
     /// Should draw bold text with brighter colors instead of bold font
     #[serde(default, deserialize_with = "failure_default")]
-    draw_bold_text_with_bright_colors: DefaultTrueBool,
+    draw_bold_text_with_bright_colors: bool,
 
     #[serde(default, deserialize_with = "failure_default")]
     pub colors: Colors,
@@ -108,11 +108,10 @@ pub struct Config<T> {
     #[serde(default, deserialize_with = "failure_default")]
     pub cursor: Cursor,
 
-    /// Enable experimental conpty backend instead of using winpty.
-    /// Will only take effect on Windows 10 Oct 2018 and later.
+    /// Use WinPTY backend even if ConPTY is available
     #[cfg(windows)]
     #[serde(default, deserialize_with = "failure_default")]
-    pub enable_experimental_conpty_backend: bool,
+    pub winpty_backend: bool,
 
     /// Send escape sequences using the alt key.
     #[serde(default, deserialize_with = "failure_default")]
@@ -120,7 +119,7 @@ pub struct Config<T> {
 
     /// Shell startup directory
     #[serde(default, deserialize_with = "option_explicit_none")]
-    working_directory: Option<PathBuf>,
+    pub working_directory: Option<PathBuf>,
 
     /// Debug options
     #[serde(default, deserialize_with = "failure_default")]
@@ -129,6 +128,10 @@ pub struct Config<T> {
     /// Additional configuration options not directly required by the terminal
     #[serde(flatten)]
     pub ui_config: T,
+
+    /// Remain open after child process exits
+    #[serde(skip)]
+    pub hold: bool,
 
     // TODO: DEPRECATED
     #[serde(default, deserialize_with = "failure_default")]
@@ -146,7 +149,7 @@ impl<T> Config<T> {
 
     #[inline]
     pub fn draw_bold_text_with_bright_colors(&self) -> bool {
-        self.draw_bold_text_with_bright_colors.0
+        self.draw_bold_text_with_bright_colors
     }
 
     /// Should show render timer
@@ -203,16 +206,6 @@ impl<T> Config<T> {
     #[inline]
     pub fn background_opacity(&self) -> f32 {
         self.background_opacity.0
-    }
-
-    #[inline]
-    pub fn working_directory(&self) -> &Option<PathBuf> {
-        &self.working_directory
-    }
-
-    #[inline]
-    pub fn set_working_directory(&mut self, working_directory: Option<PathBuf>) {
-        self.working_directory = working_directory;
     }
 }
 

@@ -16,10 +16,10 @@ use std::ptr::NonNull;
 use libc::c_char;
 
 use super::ffi::{FcObjectSet, FcObjectSetAdd, FcObjectSetCreate, FcObjectSetDestroy};
-use foreign_types::ForeignTypeRef;
+use foreign_types::{foreign_type, ForeignTypeRef};
 
 foreign_type! {
-    pub type ObjectSet {
+    pub unsafe type ObjectSet {
         type CType = FcObjectSet;
         fn drop = FcObjectSetDestroy;
     }

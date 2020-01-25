@@ -18,7 +18,7 @@ use std::path::PathBuf;
 use std::ptr::{self, NonNull};
 use std::str;
 
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::{foreign_type, ForeignType, ForeignTypeRef};
 use libc::{c_char, c_double, c_int};
 
 use super::ffi::FcResultMatch;
@@ -326,7 +326,7 @@ impl_derived_property_iter! {
 }
 
 foreign_type! {
-    pub type Pattern {
+    pub unsafe type Pattern {
         type CType = FcPattern;
         fn drop = FcPatternDestroy;
     }
@@ -420,6 +420,7 @@ impl PatternRef {
         size() => b"size\0",
         aspect() => b"aspect\0",
         pixelsize() => b"pixelsize\0",
+        pixelsizefixupfactor() => b"pixelsizefixupfactor\0",
         scale() => b"scale\0",
         dpi() => b"dpi\0"
     }
@@ -517,7 +518,7 @@ impl PatternRef {
     }
 
     pub fn get_width(&self) -> Option<Width> {
-        unsafe { self.get_integer(b"width\0").nth(0).map(Width::from) }
+        unsafe { self.get_integer(b"width\0").next().map(Width::from) }
     }
 
     pub fn rgba(&self) -> RgbaPropertyIter {

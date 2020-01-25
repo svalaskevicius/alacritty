@@ -27,8 +27,6 @@ use std::env;
 use std::error::Error;
 use std::fs;
 use std::io::{self, Write};
-#[cfg(not(windows))]
-use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
@@ -51,11 +49,19 @@ use alacritty_terminal::tty;
 
 mod cli;
 mod config;
+mod cursor;
 mod display;
 mod event;
 mod input;
 mod logging;
+mod renderer;
+mod url;
 mod window;
+
+mod gl {
+    #![allow(clippy::all)]
+    include!(concat!(env!("OUT_DIR"), "/gl_bindings.rs"));
+}
 
 use crate::cli::Options;
 use crate::config::monitor::Monitor;
@@ -111,7 +117,7 @@ fn main() {
     // Clean up logfile
     if let Some(log_file) = log_file {
         if !persistent_logging && fs::remove_file(&log_file).is_ok() {
-            let _ = writeln!(io::stdout(), "Deleted log file at {:?}", log_file);
+            let _ = writeln!(io::stdout(), "Deleted log file at \"{}\"", log_file.display());
         }
     }
 }
@@ -122,9 +128,11 @@ fn main() {
 /// config change monitor, and runs the main display loop.
 fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(), Box<dyn Error>> {
     info!("Welcome to Alacritty");
-    if let Some(config_path) = &config.config_path {
-        info!("Configuration loaded from {:?}", config_path.display());
-    };
+
+    match &config.config_path {
+        Some(config_path) => info!("Configuration loaded from \"{}\"", config_path.display()),
+        None => info!("No configuration file found"),
+    }
 
     // Set environment variables
     tty::setup_env(&config);
@@ -162,24 +170,13 @@ fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(), 
     #[cfg(any(target_os = "macos", windows))]
     let pty = tty::new(&config, &display.size_info, None);
 
-    // Create PTY resize handle
-    //
-    // This exists because rust doesn't know the interface is thread-safe
-    // and we need to be able to resize the PTY from the main thread while the IO
-    // thread owns the EventedRW object.
-    #[cfg(windows)]
-    let resize_handle = pty.resize_handle();
-    #[cfg(not(windows))]
-    let resize_handle = pty.fd.as_raw_fd();
-
     // Create the pseudoterminal I/O loop
     //
     // pty I/O is ran on another thread as to not occupy cycles used by the
     // renderer and input processing. Note that access to the terminal state is
     // synchronized since the I/O loop updates the state, and the display
     // consumes it periodically.
-    let event_loop =
-        EventLoop::new(Arc::clone(&terminal), event_proxy.clone(), pty, config.debug.ref_test);
+    let event_loop = EventLoop::new(Arc::clone(&terminal), event_proxy.clone(), pty, &config);
 
     // The event loop channel allows write requests from the event processor
     // to be sent to the pty loop and ultimately written to the pty.
@@ -197,15 +194,8 @@ fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(), 
     let message_buffer = MessageBuffer::new();
 
     // Event processor
-    //
-    // Need the Rc<RefCell<_>> here since a ref is shared in the resize callback
-    let mut processor = Processor::new(
-        event_loop::Notifier(loop_tx.clone()),
-        Box::new(resize_handle),
-        message_buffer,
-        config,
-        display,
-    );
+    let mut processor =
+        Processor::new(event_loop::Notifier(loop_tx.clone()), message_buffer, config, display);
 
     // Kick off the I/O thread
     let io_thread = event_loop.spawn();
@@ -214,6 +204,19 @@ fn run(window_event_loop: GlutinEventLoop<Event>, config: Config) -> Result<(), 
 
     // Start event loop and block until shutdown
     processor.run(terminal, window_event_loop);
+
+    // This explicit drop is needed for Windows, ConPTY backend. Otherwise a deadlock can occur.
+    // The cause:
+    //   - Drop for Conpty will deadlock if the conout pipe has already been dropped.
+    //   - The conout pipe is dropped when the io_thread is joined below (io_thread owns pty).
+    //   - Conpty is dropped when the last of processor and io_thread are dropped, because both of
+    //     them own an Arc<Conpty>.
+    //
+    // The fix is to ensure that processor is dropped first. That way, when io_thread (i.e. pty)
+    // is dropped, it can ensure Conpty is dropped before the conout pipe in the pty drop order.
+    //
+    // FIXME: Change PTY API to enforce the correct drop order with the typesystem.
+    drop(processor);
 
     // Shutdown PTY parser event loop
     loop_tx.send(Msg::Shutdown).expect("Error sending shutdown to pty event loop");

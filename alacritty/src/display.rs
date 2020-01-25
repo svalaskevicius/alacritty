@@ -14,35 +14,37 @@
 
 //! The display subsystem including window management, font rasterization, and
 //! GPU drawing.
-use std::cmp::max;
 use std::f64;
-use std::fmt;
+use std::fmt::{self, Formatter};
 use std::time::Instant;
 
 use glutin::dpi::{PhysicalPosition, PhysicalSize};
+use glutin::event::ModifiersState;
 use glutin::event_loop::EventLoop;
+#[cfg(not(any(target_os = "macos", windows)))]
+use glutin::platform::unix::EventLoopWindowTargetExtUnix;
+use glutin::window::CursorIcon;
 use log::{debug, info};
 use parking_lot::MutexGuard;
 
-use font::{self, Rasterize, Size};
+use font::{self, Rasterize};
 
-use alacritty_terminal::config::StartupMode;
+use alacritty_terminal::config::{Font, StartupMode};
 use alacritty_terminal::event::{Event, OnResize};
 use alacritty_terminal::index::Line;
 use alacritty_terminal::message_bar::MessageBuffer;
 use alacritty_terminal::meter::Meter;
-use alacritty_terminal::renderer::rects::{RenderRect};
-use alacritty_terminal::renderer::{self, GlyphCache, QuadRenderer};
 use alacritty_terminal::term::color::Rgb;
-use alacritty_terminal::term::{cell::Flags, SizeInfo, Term};
 use alacritty_terminal::text_run::TextRun;
+use alacritty_terminal::selection::Selection;
+use alacritty_terminal::term::{RenderableCell, SizeInfo, Term, TermMode, cell::Flags};
 
 use crate::config::Config;
-use crate::event::{FontResize, Resize};
+use crate::event::{DisplayUpdate, Mouse};
+use crate::renderer::rects::{RenderRect};
+use crate::renderer::{self, GlyphCache, QuadRenderer};
+use crate::url::{Url, Urls};
 use crate::window::{self, Window};
-
-/// Font size change interval
-pub const FONT_SIZE_STEP: f32 = 0.5;
 
 #[derive(Debug)]
 pub enum Error {
@@ -60,56 +62,47 @@ pub enum Error {
 }
 
 impl std::error::Error for Error {
-    fn cause(&self) -> Option<&dyn (std::error::Error)> {
-        match *self {
-            Error::Window(ref err) => Some(err),
-            Error::Font(ref err) => Some(err),
-            Error::Render(ref err) => Some(err),
-            Error::ContextError(ref err) => Some(err),
-        }
-    }
-
-    fn description(&self) -> &str {
-        match *self {
-            Error::Window(ref err) => err.description(),
-            Error::Font(ref err) => err.description(),
-            Error::Render(ref err) => err.description(),
-            Error::ContextError(ref err) => err.description(),
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Error::Window(err) => err.source(),
+            Error::Font(err) => err.source(),
+            Error::Render(err) => err.source(),
+            Error::ContextError(err) => err.source(),
         }
     }
 }
 
 impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match *self {
-            Error::Window(ref err) => err.fmt(f),
-            Error::Font(ref err) => err.fmt(f),
-            Error::Render(ref err) => err.fmt(f),
-            Error::ContextError(ref err) => err.fmt(f),
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            Error::Window(err) => err.fmt(f),
+            Error::Font(err) => err.fmt(f),
+            Error::Render(err) => err.fmt(f),
+            Error::ContextError(err) => err.fmt(f),
         }
     }
 }
 
 impl From<window::Error> for Error {
-    fn from(val: window::Error) -> Error {
+    fn from(val: window::Error) -> Self {
         Error::Window(val)
     }
 }
 
 impl From<font::Error> for Error {
-    fn from(val: font::Error) -> Error {
+    fn from(val: font::Error) -> Self {
         Error::Font(val)
     }
 }
 
 impl From<renderer::Error> for Error {
-    fn from(val: renderer::Error) -> Error {
+    fn from(val: renderer::Error) -> Self {
         Error::Render(val)
     }
 }
 
 impl From<glutin::ContextError> for Error {
-    fn from(val: glutin::ContextError) -> Error {
+    fn from(val: glutin::ContextError) -> Self {
         Error::ContextError(val)
     }
 }
@@ -117,8 +110,11 @@ impl From<glutin::ContextError> for Error {
 /// The display wraps a window, font rasterizer, and GPU renderer
 pub struct Display {
     pub size_info: SizeInfo,
-    pub font_size: Size,
     pub window: Window,
+    pub urls: Urls,
+
+    /// Currently highlighted URL.
+    pub highlighted_url: Option<Url>,
 
     renderer: QuadRenderer,
     glyph_cache: GlyphCache,
@@ -129,7 +125,7 @@ impl Display {
     pub fn new(config: &Config, event_loop: &EventLoop<Event>) -> Result<Display, Error> {
         // Guess DPR based on first monitor
         let estimated_dpr =
-            event_loop.available_monitors().next().map(|m| m.hidpi_factor()).unwrap_or(1.);
+            event_loop.available_monitors().next().map(|m| m.scale_factor()).unwrap_or(1.);
 
         // Guess the target window dimensions
         let metrics = GlyphCache::static_metrics(config.font.clone(), estimated_dpr)?;
@@ -142,16 +138,16 @@ impl Display {
         debug!("Estimated Dimensions: {:?}", dimensions);
 
         // Create the window where Alacritty will be displayed
-        let logical = dimensions.map(|d| PhysicalSize::new(d.0, d.1).to_logical(estimated_dpr));
+        let size = dimensions.map(|(width, height)| PhysicalSize::new(width, height));
 
         // Spawn window
-        let mut window = Window::new(event_loop, &config, logical)?;
+        let mut window = Window::new(event_loop, &config, size)?;
 
-        let dpr = window.hidpi_factor();
+        let dpr = window.scale_factor();
         info!("Device pixel ratio: {}", dpr);
 
         // get window properties for initializing the other subsystems
-        let mut viewport_size = window.inner_size().to_physical(dpr);
+        let viewport_size = window.inner_size();
 
         // Create renderer
         let mut renderer = QuadRenderer::new()?;
@@ -165,12 +161,11 @@ impl Display {
         if let Some((width, height)) =
             GlyphCache::calculate_dimensions(config, dpr, cell_width, cell_height)
         {
-            let PhysicalSize { width: w, height: h } = window.inner_size().to_physical(dpr);
-            if (w - width).abs() < f64::EPSILON && (h - height).abs() < f64::EPSILON {
+            let PhysicalSize { width: w, height: h } = window.inner_size();
+            if w == width && h == height {
                 info!("Estimated DPR correctly, skipping resize");
             } else {
-                viewport_size = PhysicalSize::new(width, height);
-                window.set_inner_size(viewport_size.to_logical(dpr));
+                window.set_inner_size(PhysicalSize::new(width, height));
             }
         } else if config.window.dynamic_padding {
             // Make sure additional padding is spread evenly
@@ -184,14 +179,15 @@ impl Display {
         info!("Cell Size: {} x {}", cell_width, cell_height);
         info!("Padding: {} x {}", padding_x, padding_y);
 
+        // Create new size with at least one column and row
         let size_info = SizeInfo {
             dpr,
-            width: viewport_size.width as f32,
-            height: viewport_size.height as f32,
-            cell_width: cell_width as f32,
-            cell_height: cell_height as f32,
-            padding_x: padding_x as f32,
-            padding_y: padding_y as f32,
+            width: (viewport_size.width as f32).max(cell_width + 2. * padding_x),
+            height: (viewport_size.height as f32).max(cell_height + 2. * padding_y),
+            cell_width,
+            cell_height,
+            padding_x,
+            padding_y,
         };
 
         // Update OpenGL projection
@@ -205,18 +201,23 @@ impl Display {
 
         // We should call `clear` when window is offscreen, so when `window.show()` happens it
         // would be with background color instead of uninitialized surface.
-        window.swap_buffers();
+        #[cfg(not(any(target_os = "macos", windows)))]
+        {
+            // On Wayland we can safely ignore this call, since the window isn't visible until you
+            // actually draw something into it.
+            if event_loop.is_x11() {
+                window.swap_buffers()
+            }
+        }
 
         window.set_visible(true);
 
         // Set window position
         //
         // TODO: replace `set_position` with `with_position` once available
-        // Upstream issue: https://github.com/tomaka/winit/issues/806
+        // Upstream issue: https://github.com/rust-windowing/winit/issues/806
         if let Some(position) = config.window.position {
-            let physical = PhysicalPosition::from((position.x, position.y));
-            let logical = physical.to_logical(dpr);
-            window.set_outer_position(logical);
+            window.set_outer_position(PhysicalPosition::from((position.x, position.y)));
         }
 
         #[allow(clippy::single_match)]
@@ -229,13 +230,14 @@ impl Display {
             _ => (),
         }
 
-        Ok(Display {
+        Ok(Self {
             window,
             renderer,
             glyph_cache,
             meter: Meter::new(),
             size_info,
-            font_size: config.font.size,
+            urls: Urls::new(),
+            highlighted_url: None,
         })
     }
 
@@ -271,11 +273,9 @@ impl Display {
     }
 
     /// Update font size and cell dimensions
-    fn update_glyph_cache(&mut self, config: &Config, size: Size) {
+    fn update_glyph_cache(&mut self, config: &Config, font: Font) {
         let size_info = &mut self.size_info;
         let cache = &mut self.glyph_cache;
-
-        let font = config.font.clone().with_size(size);
 
         self.renderer.with_loader(|mut api| {
             let _ = cache.update_font_size(font, size_info.dpr, &mut api);
@@ -287,44 +287,38 @@ impl Display {
         size_info.cell_height = cell_height;
     }
 
-    /// Process resize events
-    pub fn handle_resize<T>(
+    /// Process update events
+    pub fn handle_update<T>(
         &mut self,
         terminal: &mut Term<T>,
         pty_resize_handle: &mut dyn OnResize,
         message_buffer: &MessageBuffer,
         config: &Config,
-        resize_pending: Resize,
+        update_pending: DisplayUpdate,
     ) {
         // Update font size and cell dimensions
-        if let Some(resize) = resize_pending.font_size {
-            self.font_size = match resize {
-                FontResize::Delta(delta) => max(self.font_size + delta, FONT_SIZE_STEP.into()),
-                FontResize::Reset => config.font.size,
-            };
-
-            self.update_glyph_cache(config, self.font_size);
+        if let Some(font) = update_pending.font {
+            self.update_glyph_cache(config, font);
         }
 
-        // Update the window dimensions
-        if let Some(size) = resize_pending.dimensions {
-            self.size_info.width = size.width as f32;
-            self.size_info.height = size.height as f32;
-        }
-
-        let dpr = self.size_info.dpr;
-        let width = self.size_info.width;
-        let height = self.size_info.height;
         let cell_width = self.size_info.cell_width;
         let cell_height = self.size_info.cell_height;
 
         // Recalculate padding
-        let mut padding_x = f32::from(config.window.padding.x) * dpr as f32;
-        let mut padding_y = f32::from(config.window.padding.y) * dpr as f32;
+        let mut padding_x = f32::from(config.window.padding.x) * self.size_info.dpr as f32;
+        let mut padding_y = f32::from(config.window.padding.y) * self.size_info.dpr as f32;
 
+        // Update the window dimensions
+        if let Some(size) = update_pending.dimensions {
+            // Ensure we have at least one column and row
+            self.size_info.width = (size.width as f32).max(cell_width + 2. * padding_x);
+            self.size_info.height = (size.height as f32).max(cell_height + 2. * padding_y);
+        }
+
+        // Distribute excess padding equally on all sides
         if config.window.dynamic_padding {
-            padding_x = dynamic_padding(padding_x, width, cell_width);
-            padding_y = dynamic_padding(padding_y, height, cell_height);
+            padding_x = dynamic_padding(padding_x, self.size_info.width, cell_width);
+            padding_y = dynamic_padding(padding_y, self.size_info.height, cell_height);
         }
 
         self.size_info.padding_x = padding_x.floor() as f32;
@@ -333,9 +327,8 @@ impl Display {
         let mut pty_size = self.size_info;
 
         // Subtract message bar lines from pty size
-        if resize_pending.message_buffer.is_some() {
-            let lines =
-                message_buffer.message().map(|m| m.text(&self.size_info).len()).unwrap_or(0);
+        if let Some(message) = message_buffer.message() {
+            let lines = message.text(&self.size_info).len();
             pty_size.height -= pty_size.cell_height * lines as f32;
         }
 
@@ -346,10 +339,9 @@ impl Display {
         terminal.resize(&pty_size);
 
         // Resize renderer
-        let physical =
-            PhysicalSize::new(f64::from(self.size_info.width), f64::from(self.size_info.height));
-        self.renderer.resize(&self.size_info);
+        let physical = PhysicalSize::new(self.size_info.width as u32, self.size_info.height as u32);
         self.window.resize(physical);
+        self.renderer.resize(&self.size_info);
     }
 
     /// Draw the screen
@@ -362,6 +354,8 @@ impl Display {
         terminal: MutexGuard<'_, Term<T>>,
         message_buffer: &MessageBuffer,
         config: &Config,
+        mouse: &Mouse,
+        mods: ModifiersState,
     ) {
         let grid_text_runs: Vec<TextRun> = terminal.text_runs(config).collect();
         let visual_bell_intensity = terminal.visual_bell.intensity();
@@ -369,6 +363,9 @@ impl Display {
         let metrics = self.glyph_cache.font_metrics();
         let glyph_cache = &mut self.glyph_cache;
         let size_info = self.size_info;
+
+        let selection = !terminal.selection().as_ref().map(Selection::is_empty).unwrap_or(true);
+        let mouse_mode = terminal.mode().intersects(TermMode::MOUSE_MODE);
 
         // Update IME position
         #[cfg(not(windows))]
@@ -382,6 +379,7 @@ impl Display {
         });
 
         let mut rects: Vec<RenderRect> = Vec::new();
+        let mut urls = Urls::new();
 
         // Draw grid
         {
@@ -390,6 +388,11 @@ impl Display {
             self.renderer.with_api(&config, &size_info, |mut api| {
                 // Iterate over all non-empty cells in the grid
                 for text_run in grid_text_runs {
+                    for cell in text_run.cells() {
+                        // Update URL underlines
+                        urls.update(size_info.cols().0, cell);
+                    }
+
                     // Update underline/strikeout
                     if text_run.flags.contains(Flags::UNDERLINE) {
                         let underline_metrics = (metrics.descent, metrics.underline_position, metrics.underline_thickness);
@@ -406,27 +409,51 @@ impl Display {
             });
         }
 
+        // Update visible URLs
+        self.urls = urls;
+        if let Some(url) = self.urls.highlighted(config, mouse, mods, mouse_mode, selection) {
+            rects.append(&mut url.rects(&metrics, &size_info));
+
+            self.window.set_mouse_cursor(CursorIcon::Hand);
+
+            self.highlighted_url = Some(url);
+        } else if self.highlighted_url.is_some() {
+            self.highlighted_url = None;
+
+            if mouse_mode {
+                self.window.set_mouse_cursor(CursorIcon::Default);
+            } else {
+                self.window.set_mouse_cursor(CursorIcon::Text);
+            }
+        }
+
+        // Push visual bell after url/underline/strikeout rects
+        if visual_bell_intensity != 0. {
+            let visual_bell_rect = RenderRect::new(
+                0.,
+                0.,
+                size_info.width,
+                size_info.height,
+                config.visual_bell.color,
+                visual_bell_intensity as f32,
+            );
+            rects.push(visual_bell_rect);
+        }
+
         if let Some(message) = message_buffer.message() {
             let text = message.text(&size_info);
 
             // Create a new rectangle for the background
             let start_line = size_info.lines().0 - text.len();
-            let y = size_info.padding_y + size_info.cell_height * start_line as f32;
-            rects.push(RenderRect::new(
-                0.,
-                y,
-                size_info.width,
-                size_info.height - y,
-                message.color(),
-            ));
+            let y = size_info.cell_height.mul_add(start_line as f32, size_info.padding_y);
+            let message_bar_rect =
+                RenderRect::new(0., y, size_info.width, size_info.height - y, message.color(), 1.);
 
-            // Draw rectangles including the new background
-            self.renderer.draw_rects(
-                &size_info,
-                config.visual_bell.color,
-                visual_bell_intensity,
-                rects,
-            );
+            // Push message_bar in the end, so it'll be above all other content
+            rects.push(message_bar_rect);
+
+            // Draw rectangles
+            self.renderer.draw_rects(&size_info, rects);
 
             // Relay messages to the user
             let mut offset = 1;
@@ -443,12 +470,7 @@ impl Display {
             }
         } else {
             // Draw rectangles
-            self.renderer.draw_rects(
-                &size_info,
-                config.visual_bell.color,
-                visual_bell_intensity,
-                rects,
-            );
+            self.renderer.draw_rects(&size_info, rects);
         }
 
         // Draw render timer
@@ -476,7 +498,7 @@ fn compute_cell_size(config: &Config, metrics: &font::Metrics) -> (f32, f32) {
     let offset_x = f64::from(config.font.offset.x);
     let offset_y = f64::from(config.font.offset.y);
     (
-        f32::max(1., ((metrics.average_advance + offset_x) as f32).floor()),
-        f32::max(1., ((metrics.line_height + offset_y) as f32).floor()),
+        ((metrics.average_advance + offset_x) as f32).floor().max(1.),
+        ((metrics.line_height + offset_y) as f32).floor().max(1.),
     )
 }

@@ -14,14 +14,15 @@
 use std::ops::Deref;
 use std::ptr::NonNull;
 
-use foreign_types::{ForeignType, ForeignTypeRef};
+use foreign_types::{foreign_type, ForeignType, ForeignTypeRef};
+use log::trace;
 
 use super::{ConfigRef, ObjectSetRef, PatternRef};
 
 use super::ffi::{FcFontSet, FcFontSetDestroy, FcFontSetList};
 
 foreign_type! {
-    pub type FontSet {
+    pub unsafe type FontSet {
         type CType = FcFontSet;
         fn drop = FcFontSetDestroy;
     }

@@ -13,13 +13,10 @@
 // limitations under the License.
 //
 //! Rasterization powered by DirectWrite
-extern crate dwrote;
-use self::dwrote::{
-    FontCollection, FontStretch, FontStyle, FontWeight, GlyphOffset, GlyphRunAnalysis,
-};
+use dwrote::{FontCollection, FontStretch, FontStyle, FontWeight, GlyphOffset, GlyphRunAnalysis};
 
 use super::{
-    FontDesc, FontKey, GlyphKey, KeyType, Metrics, RasterizedGlyph, Size, Slant, Style, Weight,
+    FontDesc, FontKey, GlyphKey, KeyType, Metrics, RasterizedGlyph, Size, Slant, Style, Weight, BitmapBuffer 
 };
 
 pub struct DirectWriteRasterizer {
@@ -179,7 +176,7 @@ impl crate::Rasterize for DirectWriteRasterizer {
             height: (bounds.bottom - bounds.top) as i32,
             top: -bounds.top,
             left: bounds.left,
-            buf,
+            buf: BitmapBuffer::RGB(buf),
         })
     }
 
